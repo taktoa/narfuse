@@ -10,23 +10,24 @@ import           Control.Arrow
 import           Control.Monad
 import           Data.Binary
 import           Data.Binary.Get
-import qualified Data.ByteString      as BS
+import qualified Data.ByteString            as BS
+import qualified Data.ByteString.Lazy       as LBS
 import qualified Data.ByteString.Lazy.Char8 as LBSC
-import qualified Data.ByteString.Lazy as LBS
 import           Data.Foldable
 import           Data.Hashable
-import qualified Data.HashMap.Lazy    as Map
+import qualified Data.HashMap.Lazy          as Map
+import           Data.List
 import           Data.Maybe
 import           Data.Monoid
 import           Data.Word
-import           Data.List
-import           GHC.Generics         (Generic)
-import           System.IO.Posix.MMap
 import           Debug.Trace
+import           GHC.Generics               (Generic)
 import           System.Directory
 import           System.Environment
 import           System.Fuse
+import           System.IO.Posix.MMap
 import           System.Posix.Files
+import           System.Posix.Types
 
 type Map = Map.HashMap
 
@@ -80,10 +81,10 @@ instance Functor MMap where
 type Path = LBS.ByteString
 type Name = LBS.ByteString
 
-data NARNode = File      { _isExecutable :: !Bool
-                         , _contents     :: LBS.ByteString }
-             | Symlink   { _target :: !Path }
-             | Directory { _children :: Map.HashMap Name NARNode }
+data NARNode = NFile      { _isExecutable :: !Bool
+                          , _contents     :: LBS.ByteString }
+             | NSymlink   { _target :: !Path }
+             | NDirectory { _children :: Map.HashMap Name NARNode }
              deriving (Eq, Read, Generic)
 
 newtype NARFile = NARFile { _root :: NARNode }
@@ -157,13 +158,13 @@ entryGet = do matchNSG "entry"
               return (name, node)
 
 regularGet :: Get NARNode
-regularGet = File <$> execGet <*> contentsGet
+regularGet = NFile <$> execGet <*> contentsGet
 
 symlinkGet :: Get NARNode
-symlinkGet = matchNSG "target" >> Symlink . snd <$> narStringG
+symlinkGet = matchNSG "target" >> NSymlink . snd <$> narStringG
 
 directoryGet :: Get NARNode
-directoryGet = Main.Directory . Map.fromList <$> many entryGet
+directoryGet = NDirectory . Map.fromList <$> many entryGet
 
 magicGet :: Get ()
 magicGet = do (_, magic) <- narStringG
@@ -182,39 +183,36 @@ instance Show Foo where
 
 instance Show NARNode where
     show = go 2
-        where
-            go :: Int -> NARNode -> String
-            go i (File executable contents) = (if executable then "executable " else "") <> "FILE " <> showB contents <> "\n"
-            go i (Main.Directory entries) = "{\n" <> (mconcat $ intersperse "" $ toList $ Map.mapWithKey showX entries) <> indent (i-2) <> "}\n"
-                where
-                    showX name node = indent i <> "dir entry " <> show name <> "=" <> go (i+2) node
-            go i (Symlink l) = "symlink to " <> show l <> "\n"
-            indent :: Int -> String
-            indent i = if i < 1 then "" else ' ' : indent (i - 1)
-            showB bs = if (LBS.length bs > 1024) || isJust (LBS.findIndex (== 0) bs)
-                 then "\ESC[31m<too long>\ESC[0m"
-                 else show bs
+      where
+        go :: Int -> NARNode -> String
+        go i (NFile executable contents) = (if executable then "executable " else "") <> "FILE " <> showB contents <> "\n"
+        go i (NDirectory entries) = "{\n" <> (mconcat $ intersperse "" $ toList $ Map.mapWithKey showX entries) <> indent (i-2) <> "}\n"
+          where
+            showX name node = indent i <> "dir entry " <> show name <> "=" <> go (i+2) node
+        go i (NSymlink l) = "symlink to " <> show l <> "\n"
+        indent :: Int -> String
+        indent i = if i < 1 then "" else ' ' : indent (i - 1)
+        showB bs = if (LBS.length bs > 1024) || isJust (LBS.findIndex (== 0) bs)
+                   then "\ESC[31m<too long>\ESC[0m"
+                   else show bs
 
 showDot (NARFile node) = "digraph test123 {\n" <> go "" "root" node <> "}"
     where
         go :: String -> String -> NARNode -> String
-        go parent name (File executable contents) = quote parent <> " -> " <> quote (name <> (if executable then " (executable)" else "")) <> ";\n"
-        go parent name (Main.Directory entries) = quote parent <> " -> " <> quote name <> ";\n" <> (mconcat $ intersperse "" $ toList $ Map.mapWithKey showX entries)
+        go parent name (NFile executable contents) = quote parent <> " -> " <> quote (name <> (if executable then " (executable)" else "")) <> ";\n"
+        go parent name (NDirectory entries) = quote parent <> " -> " <> quote name <> ";\n" <> (mconcat $ intersperse "" $ toList $ Map.mapWithKey showX entries)
                 where
                     showX entry_name node = go name (LBSC.unpack entry_name) node
-        go parent name (Symlink l) = quote parent <> " -> " <> quote name <> ";\n" <> quote name <> " -> " <> quote (LBSC.unpack l) <> " [color=blue];\n"
+        go parent name (NSymlink l) = quote parent <> " -> " <> quote name <> ";\n" <> quote name <> " -> " <> quote (LBSC.unpack l) <> " [color=blue];\n"
         indent :: Int -> String
         indent i = if i < 1 then "" else ' ' : indent (i - 1)
         quote x = "\"" <> x <> "\""
 
 readDir :: NARFile -> [String] -> Maybe NARNode
 readDir (NARFile node) path = go path node
-    where
-        go (x : xs) (Main.Directory entries)
-            = case Map.lookup (LBSC.pack x) entries of
-                Just e -> go xs e
-                Nothing -> Nothing
-        go _ n = Just n
+  where
+    go (x : xs) (NDirectory es) = Map.lookup (LBSC.pack x) es >>= go xs
+    go _        n               = Just n
 
 instance Binary Foo where
   get = Foo <$> many narStringG
@@ -265,80 +263,84 @@ main = do
     Nothing -> print "404"
     Just n -> print ("found " <> show n)
 
+endsWith :: String -> String -> Maybe String
+endsWith str ext = go "" (length ext) (length str) str
+  where
+    go _ _  _  []                            = Nothing
+    go _ _  0  _                             = Nothing
+    go a le ls s      | ls == le && s == ext = Just $ reverse a
+    go a le ls (s:ss)                        = go (s:a) le (ls - 1) ss
+
 -- return storePaths or Nothings
 isNar :: String -> Maybe String
-isNar name = go "" name
-    where
-        go :: String -> String -> Maybe String
-        go rest (x:".nar") = Just $ reverse (x : rest)
-        go rest (x:xs) = go (x : rest) xs
-        go _ _ = Nothing
+isNar name = name `endsWith` ".nar"
+
 
 -- strip out the Nothings
-reFilter :: [ Maybe String ] -> [ String ]
+reFilter :: [Maybe String] -> [String]
 reFilter list = go [] list
-    where
-        go rest (x:xs) = case x of
-            Nothing -> go rest xs
-            Just n -> go (n : rest) xs
-        go rest _ = rest
+  where
+    go rest (x:xs) = case x of Nothing -> go rest xs
+                               Just n -> go (n : rest) xs
+    go rest _ = rest
 
-thing :: [ FilePath ] -> [ FilePath ]
-thing files = reFilter (map isNar files)
+getNARFiles :: [FilePath] -> [FilePath]
+getNARFiles = concatMap (toList . isNar)
 
 test1 :: IO ()
 test1 = do
-    listing <- getDirectoryContents "/home/clever/apps/data_files/"
-    print $ (thing listing)
+  listing <- getDirectoryContents "/home/clever/apps/data_files/"
+  print $ getNARFiles listing
 
 test2 :: IO ()
 test2 = do
-    prog <- getProgName
-    fuseRun prog [ "-f", "-o", "allow_other", "/home/clever/apps/narparser/mnt" ] narFSOps defaultExceptionHandler
+  prog <- getProgName
+  let opts = [ "-f", "-o", "allow_other", "/home/clever/apps/narparser/mnt" ]
+  fuseRun prog opts narFSOps defaultExceptionHandler
 
 type HT = ()
 
 narFSOps :: FuseOperations HT
-narFSOps = defaultFuseOps {
-    fuseGetFileStat   = narGetFileStat,
-    fuseOpenDirectory = narOpenDirectory,
-    fuseReadDirectory = narReadDirectory
-}
+narFSOps = defaultFuseOps { fuseGetFileStat   = narGetFileStat
+                          , fuseOpenDirectory = narOpenDirectory
+                          , fuseReadDirectory = narReadDirectory
+                          }
 
-dirStat ctx = FileStat {
-    statEntryType = System.Fuse.Directory,
-    statFileMode = foldr1 unionFileModes [
-        ownerReadMode,
-        ownerExecuteMode,
-        groupReadMode,
-        groupExecuteMode,
-        otherReadMode,
-        otherExecuteMode
-    ],
-    statLinkCount = 2,
-    statFileOwner = 0,
-    statFileGroup = 0,
-    statSpecialDeviceID = 0,
-    statFileSize = 4096,
-    statBlocks = 1,
-    statAccessTime = 0,
-    statModificationTime = 0,
-    statStatusChangeTime = 0
-}
+unionModes :: [FileMode] -> FileMode
+unionModes = foldr1 unionFileModes
 
-fileStat ctx = FileStat {
-    statEntryType = RegularFile,
-    statFileMode = foldr1 unionFileModes [ ownerReadMode, groupReadMode, otherReadMode ],
-    statLinkCount = 1,
-    statFileOwner = 0,
-    statFileGroup = 0,
-    statSpecialDeviceID = 0,
-    statFileSize = 0, -- FIXME
-    statBlocks = 1,
-    statAccessTime = 0,
-    statModificationTime = 0,
-    statStatusChangeTime = 0
-}
+dirStat :: FuseContext -> FileStat
+dirStat ctx = FileStat { statEntryType        = System.Fuse.Directory
+                       , statFileMode         = unionModes [ ownerReadMode
+                                                           , ownerExecuteMode
+                                                           , groupReadMode
+                                                           , groupExecuteMode
+                                                           , otherReadMode
+                                                           , otherExecuteMode ]
+                       , statLinkCount        = 2
+                       , statFileOwner        = 0
+                       , statFileGroup        = 0
+                       , statSpecialDeviceID  = 0
+                       , statFileSize         = 4096
+                       , statBlocks           = 1
+                       , statAccessTime       = 0
+                       , statModificationTime = 0
+                       , statStatusChangeTime = 0 }
+
+fileStat :: FuseContext -> FileStat
+fileStat ctx = FileStat { statEntryType        = RegularFile
+                        , statFileMode         = unionModes [ ownerReadMode
+                                                            , groupReadMode
+                                                            , otherReadMode ]
+                        , statLinkCount        = 1
+                        , statFileOwner        = 0
+                        , statFileGroup        = 0
+                        , statSpecialDeviceID  = 0
+                        , statFileSize         = 0 -- FIXME
+                        , statBlocks           = 1
+                        , statAccessTime       = 0
+                        , statModificationTime = 0
+                        , statStatusChangeTime = 0 }
 
 narGetFileStat :: FilePath -> IO (Either Errno FileStat)
 narGetFileStat "/" = do
@@ -354,6 +356,6 @@ narReadDirectory :: FilePath -> IO (Either Errno [(FilePath, FileStat)])
 narReadDirectory "/" = do
     ctx <- getFuseContext
     listing <- getDirectoryContents "/home/clever/apps/data_files/"
-    --modified <- map (thing2 ctx) $ thing listing
+    --modified <- map (thing2 ctx) $ getNARFiles listing
     return $ Right $ [(".",    dirStat  ctx),
-                      ("..",   dirStat  ctx)] <> (map (thing2 ctx) $ thing listing)
+                      ("..",   dirStat  ctx)] <> (map (thing2 ctx) $ getNARFiles listing)
