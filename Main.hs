@@ -1,4 +1,4 @@
-{-# OPTIONS_GHC -fno-warn-unused-do-bind #-}
+{-# OPTIONS_GHC -fno-warn-unused-do-bind -Wall #-}
 {-# LANGUAGE DeriveGeneric        #-}
 {-# LANGUAGE OverloadedStrings    #-}
 {-# LANGUAGE TypeSynonymInstances #-}
@@ -8,6 +8,7 @@ module Main where
 import           Control.Applicative
 import           Control.Arrow
 import           Control.Monad
+import           Control.Concurrent.MVar
 import           Data.Binary
 import           Data.Binary.Get
 import qualified Data.ByteString            as BS
@@ -20,6 +21,7 @@ import           Data.List
 import           Data.Maybe
 import           Data.Monoid
 import           Data.Word
+import           Data.Int
 import           Debug.Trace
 import           GHC.Generics               (Generic)
 import           System.Directory
@@ -90,11 +92,10 @@ data NARNode = NFile      { _isExecutable :: !Bool
 newtype NARFile = NARFile { _root :: NARNode }
                 deriving (Eq, Show, Read, Generic)
 
--- Shuts up the compiler for now, but orphan instances are bad,
--- so this should be deleted.
-instance (Eq k, Hashable k, Binary k, Binary v) => Binary (Map k v) where
-  put = put . Map.toList
-  get = Map.fromList <$> get
+data RuntimeState = RuntimeState { _DataDir :: FilePath
+                                 , _NarCache :: MVar (Map.HashMap String NARFile) }
+
+data HT = HT { _handle :: NARNode }
 
 mkNARFile :: NARNode -> NARFile
 mkNARFile = NARFile -- FIXME: normalize NARFile
@@ -155,10 +156,10 @@ entryGet = do matchNSG "entry"
               matchNSG "node"
               node <- get
               matchNSG ")"
-              return (name, node)
+              return (trace ("got name " <> show name) name, trace "got node" node)
 
 regularGet :: Get NARNode
-regularGet = NFile <$> execGet <*> contentsGet
+regularGet = trace "got file" $ NFile <$> execGet <*> contentsGet
 
 symlinkGet :: Get NARNode
 symlinkGet = matchNSG "target" >> NSymlink . snd <$> narStringG
@@ -185,21 +186,22 @@ instance Show NARNode where
     show = go 2
       where
         go :: Int -> NARNode -> String
-        go i (NFile executable contents) = (if executable then "executable " else "") <> "FILE " <> showB contents <> "\n"
+        go _ (NFile executable contents) = (if executable then "executable " else "") <> "FILE " <> showB contents <> "\n"
         go i (NDirectory entries) = "{\n" <> (mconcat $ intersperse "" $ toList $ Map.mapWithKey showX entries) <> indent (i-2) <> "}\n"
           where
             showX name node = indent i <> "dir entry " <> show name <> "=" <> go (i+2) node
-        go i (NSymlink l) = "symlink to " <> show l <> "\n"
+        go _ (NSymlink l) = "symlink to " <> show l <> "\n"
         indent :: Int -> String
         indent i = if i < 1 then "" else ' ' : indent (i - 1)
         showB bs = if (LBS.length bs > 1024) || isJust (LBS.findIndex (== 0) bs)
                    then "\ESC[31m<too long>\ESC[0m"
                    else show bs
 
+showDot :: NARFile -> String
 showDot (NARFile node) = "digraph test123 {\n" <> go "" "root" node <> "}"
     where
         go :: String -> String -> NARNode -> String
-        go parent name (NFile executable contents) = quote parent <> " -> " <> quote (name <> (if executable then " (executable)" else "")) <> ";\n"
+        go parent name (NFile executable _) = quote parent <> " -> " <> quote (name <> (if executable then " (executable)" else "")) <> ";\n"
         go parent name (NDirectory entries) = quote parent <> " -> " <> quote name <> ";\n" <> (mconcat $ intersperse "" $ toList $ Map.mapWithKey showX entries)
                 where
                     showX entry_name node = go name (LBSC.unpack entry_name) node
@@ -218,6 +220,7 @@ instance Binary Foo where
   get = Foo <$> many narStringG
 
 instance Binary NARNode where
+  put = undefined
   get = do matchNSG "("
            matchNSG "type"
            (_, t) <- narStringG
@@ -260,7 +263,7 @@ main = do
   --decodeNARFile (head args) >>= putStrLn . showDot
   let path = splitPath "/share/man/man1"
   case readDir file path of
-    Nothing -> print "404"
+    Nothing -> putStrLn "404"
     Just n -> print ("found " <> show n)
 
 endsWith :: String -> String -> Maybe String
@@ -292,19 +295,24 @@ test1 = do
   listing <- getDirectoryContents "/home/clever/apps/data_files/"
   print $ getNARFiles listing
 
+newNarCache :: Map.HashMap String NARFile
+newNarCache = Map.empty
+
 test2 :: IO ()
 test2 = do
   prog <- getProgName
   let opts = [ "-f", "-o", "allow_other", "/home/clever/apps/narparser/mnt" ]
-  fuseRun prog opts narFSOps defaultExceptionHandler
+  empty_map <- newMVar newNarCache
+  let state = RuntimeState "/home/clever/apps/data_files" empty_map
+  fuseRun prog opts (narFSOps state) defaultExceptionHandler
 
-type HT = ()
-
-narFSOps :: FuseOperations HT
-narFSOps = defaultFuseOps { fuseGetFileStat   = narGetFileStat
-                          , fuseOpenDirectory = narOpenDirectory
-                          , fuseReadDirectory = narReadDirectory
-                          }
+narFSOps :: RuntimeState -> FuseOperations HT
+narFSOps x = defaultFuseOps { fuseGetFileStat   = narGetFileStat x
+                            , fuseOpenDirectory = narOpenDirectory x
+                            , fuseReadDirectory = narReadDirectory x
+                            , fuseOpen          = narOpen x
+                            , fuseRead          = narRead x
+                            }
 
 unionModes :: [FileMode] -> FileMode
 unionModes = foldr1 unionFileModes
@@ -327,8 +335,8 @@ dirStat ctx = FileStat { statEntryType        = System.Fuse.Directory
                        , statModificationTime = 0
                        , statStatusChangeTime = 0 }
 
-fileStat :: FuseContext -> FileStat
-fileStat ctx = FileStat { statEntryType        = RegularFile
+fileStat :: Int64 -> FuseContext -> FileStat
+fileStat size ctx = FileStat { statEntryType        = RegularFile
                         , statFileMode         = unionModes [ ownerReadMode
                                                             , groupReadMode
                                                             , otherReadMode ]
@@ -336,26 +344,80 @@ fileStat ctx = FileStat { statEntryType        = RegularFile
                         , statFileOwner        = 0
                         , statFileGroup        = 0
                         , statSpecialDeviceID  = 0
-                        , statFileSize         = 0 -- FIXME
+                        , statFileSize         = fromIntegral size
                         , statBlocks           = 1
                         , statAccessTime       = 0
                         , statModificationTime = 0
                         , statStatusChangeTime = 0 }
 
-narGetFileStat :: FilePath -> IO (Either Errno FileStat)
-narGetFileStat "/" = do
+statRootNode :: NARFile -> (FuseContext -> FileStat)
+statRootNode (NARFile node) = go node
+  where
+    go (NFile e c) = fileStat $ LBSC.length c
+    go (NDirectory e) = dirStat
+
+narGetFileStat :: RuntimeState -> FilePath -> IO (Either Errno FileStat)
+narGetFileStat dataDir "/" = do
     ctx <- getFuseContext
     return $ Right $ dirStat ctx
+narGetFileStat state x = do
+  let file = _DataDir state <> "/" <> (head $ splitPath x) <> ".nar"
+  ctx <- trace "filestat other" getFuseContext
+  handle <- decodeNARFile file
+  --print handle
+  return $ Right $ statRootNode handle ctx
 
-narOpenDirectory "/" = return eOK
+narOpen :: RuntimeState -> FilePath -> OpenMode -> OpenFileFlags -> IO (Either Errno HT)
+narOpen state path mode flags = do
+  let pathparts = splitPath path
+  putStrLn $ "fopen " <> show pathparts
+  ctx <- getFuseContext
+  handle <- getNarHandle state (pathparts !! 0)
+  go pathparts $ _root handle
+  where
+    go (x:[]) f = return $ Right $ HT f
+
+narRead :: RuntimeState -> FilePath -> HT -> ByteCount -> FileOffset -> IO (Either Errno BS.ByteString)
+narRead state path hnd byteCount offset = do
+  let pathparts = splitPath path
+  let fullContents = _contents (_handle hnd)
+  putStrLn $ "read " <> show pathparts <> " x " <> show (_handle hnd)
+  return $ Right $ LBSC.toStrict (substr (fromIntegral offset) (fromIntegral byteCount) fullContents)
+  where
+    substr :: Int64 -> Int64 -> LBSC.ByteString -> LBSC.ByteString
+    substr offset size input = LBSC.take size (LBSC.drop offset input)
+
+narOpenDirectory :: RuntimeState -> FilePath -> IO Errno
+narOpenDirectory state "/" = return eOK
 
 thing2 :: FuseContext -> FilePath -> (FilePath, FileStat)
 thing2 ctx nar = (nar, (dirStat ctx))
 
-narReadDirectory :: FilePath -> IO (Either Errno [(FilePath, FileStat)])
-narReadDirectory "/" = do
-    ctx <- getFuseContext
-    listing <- getDirectoryContents "/home/clever/apps/data_files/"
-    --modified <- map (thing2 ctx) $ getNARFiles listing
-    return $ Right $ [(".",    dirStat  ctx),
-                      ("..",   dirStat  ctx)] <> (map (thing2 ctx) $ getNARFiles listing)
+getNarHandle :: RuntimeState -> String -> IO NARFile
+getNarHandle state storepath = newHandle
+  where
+    go = do
+      cache <- takeMVar (_NarCache state)
+      let result = Map.lookup storepath cache
+      return $ decide result cache
+    file = _DataDir state <> "/" <> (head $ splitPath storepath) <> ".nar"
+    newHandle = decodeNARFile $ trace ("opening file " <> file) file
+    decide :: Maybe NARFile -> Map.HashMap String NARFile -> IO NARFile
+    decide res cache = case res of
+      (Just f) -> do
+        putMVar (_NarCache state) cache
+        return f
+      (Nothing) -> do
+        new_entry <- newHandle
+        let new_cache = Map.insert storepath new_entry cache
+        putMVar (_NarCache state) new_cache
+        return new_entry
+
+narReadDirectory :: RuntimeState -> FilePath -> IO (Either Errno [(FilePath, FileStat)])
+narReadDirectory state "/" = do
+  ctx <- getFuseContext
+  listing <- getDirectoryContents $ _DataDir state
+  return $ Right $ [(".",    dirStat  ctx),
+                    ("..",   dirStat  ctx)] <> makeListing ctx listing
+  where
+    makeListing ctx listing = map (\nar -> (nar, dirStat ctx)) $ getNARFiles listing
