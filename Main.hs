@@ -28,7 +28,7 @@ import           GHC.Generics               (Generic)
 import           System.Directory
 import           System.Environment
 import           System.Fuse
-import           System.IO.Posix.MMap
+import           System.IO.Posix.MMap.Lazy
 import           System.Posix.Files
 import           System.Posix.Types
 import Data.Time
@@ -298,20 +298,25 @@ test1 = do
 newNarCache :: Map.HashMap String NARFile
 newNarCache = Map.empty
 
-tmain :: IO ()
-tmain = do
+main :: IO ()
+main = do
   args <- getArgs
   prog <- getProgName
-  --let opts = [ "-f", "-o", "allow_other", "/home/clever/apps/narparser/mnt" ]
+  let opts = [ "-f", "-o", "allow_other", "/home/clever/apps/narparser/mnt" ]
   empty_map <- newMVar newNarCache
   let state = RuntimeState "/home/clever/apps/container_data" empty_map
   --let state = RuntimeState "/home/clever/apps/narparser/sample" empty_map
-  --fuseRun prog opts (narFSOps state) defaultExceptionHandler
-  fuseMain (narFSOps state) defaultExceptionHandler
+  fuseRun prog opts (narFSOps state) defaultExceptionHandler
+  --fuseMain (narFSOps state) defaultExceptionHandler
 
-main :: IO ()
-main = do
-  file <- decodeNARFile "/nix/store/wla2an5q64wddgz7zjxkkllpvibzxw7p-data/0b0y9jz2b1q0hlf40p50ygrj2vhbk0fq-glibc-locales-2.23.nar"
+newDecodeNARFile :: FilePath -> IO NARFile
+newDecodeNARFile path = do
+  rawfile <- unsafeMMapFile path
+  return $ decode rawfile
+
+test4 :: IO ()
+test4 = do
+  file <- newDecodeNARFile "/nix/store/wla2an5q64wddgz7zjxkkllpvibzxw7p-data/0b0y9jz2b1q0hlf40p50ygrj2vhbk0fq-glibc-locales-2.23.nar"
   a <- getPOSIXTime
   print file
   b <- getPOSIXTime
@@ -432,7 +437,7 @@ narRead _ path hnd byteCount offset = do
     substr offset2 size input = LBSC.take size (LBSC.drop offset2 input)
 
 getNarHandle :: RuntimeState -> String -> IO (Maybe NARFile)
-getNarHandle state storepath = newHandle file1
+getNarHandle state storepath = go
   where
     go = do
       cache <- takeMVar (_NarCache state)
@@ -442,7 +447,7 @@ getNarHandle state storepath = newHandle file1
       decide result cache
     file1 = _DataDir state <> "/" <> (head $ splitPath storepath) <> ".nar"
     unsafeNewHandle :: FilePath -> IO NARFile
-    unsafeNewHandle file2 = decodeNARFile $ trace ("opening file " <> file2) file2
+    unsafeNewHandle file2 = newDecodeNARFile $ trace ("opening file " <> file2) file2
     newHandle :: FilePath -> IO (Maybe NARFile)
     newHandle file = catch
       (do
