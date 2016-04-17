@@ -7,9 +7,9 @@ module Main where
 
 import           Control.Applicative
 import           Control.Arrow
-import           Control.Monad
 import           Control.Concurrent.MVar
 import           Control.Exception
+import           Control.Monad
 import           Data.Binary
 import           Data.Binary.Get
 import qualified Data.ByteString            as BS
@@ -18,11 +18,13 @@ import qualified Data.ByteString.Lazy.Char8 as LBSC
 import           Data.Foldable
 import           Data.Hashable
 import qualified Data.HashMap.Lazy          as Map
+import           Data.Int
 import           Data.List
 import           Data.Maybe
 import           Data.Monoid
+import           Data.Time
+import           Data.Time.Clock.POSIX
 import           Data.Word
-import           Data.Int
 import           Debug.Trace
 import           GHC.Generics               (Generic)
 import           System.Directory
@@ -31,8 +33,6 @@ import           System.Fuse
 import           System.IO.Posix.MMap.Lazy
 import           System.Posix.Files
 import           System.Posix.Types
-import Data.Time
-import Data.Time.Clock.POSIX
 
 
 type Map = Map.HashMap
@@ -96,7 +96,7 @@ data NARNode = NFile      { _isExecutable :: !Bool
 newtype NARFile = NARFile { _root :: NARNode }
                 deriving (Eq, Show, Read, Generic)
 
-data RuntimeState = RuntimeState { _DataDir :: FilePath
+data RuntimeState = RuntimeState { _DataDir  :: FilePath
                                  , _NarCache :: MVar (Map.HashMap String NARFile) }
 
 data HT = HT { _handle :: NARNode }
