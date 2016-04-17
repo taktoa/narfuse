@@ -2,6 +2,7 @@
 {-# LANGUAGE DeriveGeneric        #-}
 {-# LANGUAGE OverloadedStrings    #-}
 {-# LANGUAGE TypeSynonymInstances #-}
+{-# LANGUAGE ViewPatterns         #-}
 
 module Main where
 
@@ -9,6 +10,7 @@ import           Control.Applicative
 import           Control.Arrow
 import           Control.Concurrent.MVar
 import           Control.Exception
+import           Control.Lens
 import           Control.Monad
 import           Data.Binary
 import           Data.Binary.Get
@@ -34,7 +36,6 @@ import           System.IO.Posix.MMap.Lazy
 import           System.Posix.Files
 import           System.Posix.Types
 
-
 type Map = Map.HashMap
 
 type Offset = Int
@@ -49,55 +50,21 @@ instance Functor MMap where
   fmap f (MMapPure x)        = MMapPure $ f x
   fmap f (MMapModify o s cb) = MMapModify o s $ second f . cb
 
---------------------------------------------------------------------------------
----- NOT DONE YET --------------------------------------------------------------
---------------------------------------------------------------------------------
-
--- class Applicative m where
---   pure  :: a -> m a
---   (<*>) :: m (a -> b) -> m a -> m b
-
-
--- instance Applicative MMap where
---   pure = MMapPure
---   (MMapPure f)        <*> mx                     = fmap f mx
---   (MMapModify o s cb) <*> (MMapPure x)           = MMapModify o s (second (\f -> f x) . cb)
---   (MMapModify o s cb) <*> (MMapModify o' s' cb') = MMapModify on sn cbn
---     where
---       -- o,  o'  :: Offset
---       -- s,  s'  :: Size
---       -- cb      :: ByteString -> (Maybe ByteString, a -> b)
---       -- cb'     :: ByteString -> (Maybe ByteString, a)
---       on = undefined :: Offset
---       sn = undefined :: Size
---       cbn = undefined :: ByteString -> (Maybe ByteString, b)
---   -- cb  :: ByteString -> (Maybe ByteString, a -> b)
---   -- cb' :: ByteString -> (Maybe ByteString, a)
-
--- [(o o o o o o o o) (o o o o o o o o) (o o o o o o o o) (o o o o o o o o)]
--- modify at offset 4 with size 8 to get x
--- [(o o o o x x x x) (x x x x o o o o) (o o o o o o o o) (o o o o o o o o)]
--- modify at offset 6 with size 4 to get y
--- [(o o o o x x y y) (y y x x o o o o) (o o o o o o o o) (o o o o o o o o)]
-
---------------------------------------------------------------------------------
----- REFERENCE -----------------------------------------------------------------
---------------------------------------------------------------------------------
-
 type Path = LBS.ByteString
 type Name = LBS.ByteString
 
 data NARNode = NFile      { _isExecutable :: !Bool
                           , _contents     :: LBS.ByteString }
              | NSymlink   { _target :: Path }
-             | NDirectory { _children :: Map.HashMap Name NARNode }
+             | NDirectory { _children :: Map Name NARNode }
              deriving (Eq, Read, Generic)
 
 newtype NARFile = NARFile { _root :: NARNode }
                 deriving (Eq, Show, Read, Generic)
 
-data RuntimeState = RuntimeState { _DataDir  :: FilePath
-                                 , _NarCache :: MVar (Map.HashMap String NARFile) }
+data RuntimeState = RuntimeState { _dataDir  :: FilePath
+                                 , _narCache :: MVar (Map String NARFile) }
+                    deriving ()
 
 data HT = HT { _handle :: NARNode }
 
@@ -326,55 +293,51 @@ test4 = do
   print (c-b)
 
 narFSOps :: RuntimeState -> FuseOperations HT
-narFSOps x = defaultFuseOps { fuseGetFileStat   = narGetFileStat x
-                            , fuseReadSymbolicLink = narReadSymbolicLink x
-                            , fuseOpenDirectory = narOpenDirectory x
-                            , fuseReadDirectory = narReadDirectory x
-                            , fuseOpen          = narOpen x
-                            , fuseRead          = narRead x
-                            }
+narFSOps x = defaultFuseOps { fuseGetFileStat      = narGetFileStat x
+                            , fuseReadSymbolicLink = narReadSymlink x
+                            , fuseOpenDirectory    = narOpenDirectory x
+                            , fuseReadDirectory    = narReadDirectory x
+                            , fuseOpen             = narOpen x
+                            , fuseRead             = narRead x }
 
 unionModes :: [FileMode] -> FileMode
 unionModes = foldr1 unionFileModes
 
+readModes, execModes :: [FileMode]
+readModes = [ownerReadMode, groupReadMode, otherReadMode]
+execModes = [ownerExecuteMode, groupExecuteMode, otherExecuteMode]
+
 dirStat :: FileStat
-dirStat = FileStat { statEntryType        = System.Fuse.Directory
-                       , statFileMode         = unionModes [ ownerReadMode
-                                                           , ownerExecuteMode
-                                                           , groupReadMode
-                                                           , groupExecuteMode
-                                                           , otherReadMode
-                                                           , otherExecuteMode ]
-                       , statLinkCount        = 2
-                       , statFileOwner        = 0
-                       , statFileGroup        = 0
-                       , statSpecialDeviceID  = 0
-                       , statFileSize         = 4096
-                       , statBlocks           = 1
-                       , statAccessTime       = 0
-                       , statModificationTime = 0
-                       , statStatusChangeTime = 0 }
+dirStat = FileStat { statEntryType        = Directory
+                   , statFileMode         = unionModes $ readModes <> execModes
+                   , statLinkCount        = 2
+                   , statFileOwner        = 0
+                   , statFileGroup        = 0
+                   , statSpecialDeviceID  = 0
+                   , statFileSize         = 4096
+                   , statBlocks           = 1
+                   , statAccessTime       = 0
+                   , statModificationTime = 0
+                   , statStatusChangeTime = 0 }
 
 fileStat :: Bool -> Int64 -> FileStat
 fileStat exec size = FileStat { statEntryType        = RegularFile
-                        , statFileMode         = unionModes ([ ownerReadMode
-                                                            , groupReadMode
-                                                            , otherReadMode ] <> if exec then [ ownerExecuteMode, groupExecuteMode, otherExecuteMode ] else [])
-                        , statLinkCount        = 1
-                        , statFileOwner        = 0
-                        , statFileGroup        = 0
-                        , statSpecialDeviceID  = 0
-                        , statFileSize         = fromIntegral size
-                        , statBlocks           = 1
-                        , statAccessTime       = 0
-                        , statModificationTime = 0
-                        , statStatusChangeTime = 0 }
+                              , statFileMode         = fileModes
+                              , statLinkCount        = 1
+                              , statFileOwner        = 0
+                              , statFileGroup        = 0
+                              , statSpecialDeviceID  = 0
+                              , statFileSize         = fromIntegral size
+                              , statBlocks           = 1
+                              , statAccessTime       = 0
+                              , statModificationTime = 0
+                              , statStatusChangeTime = 0 }
+  where
+    fileModes = unionModes $ readModes <> if exec then execModes else []
 
 linkStat :: Path -> FileStat
 linkStat t = FileStat   { statEntryType        = SymbolicLink
-                        , statFileMode         = unionModes [ ownerReadMode
-                                                            , groupReadMode
-                                                            , otherReadMode ]
+                        , statFileMode         = unionModes readModes
                         , statLinkCount        = 1
                         , statFileOwner        = 0
                         , statFileGroup        = 0
@@ -390,41 +353,27 @@ statNode (NFile e c) = fileStat e $ fromIntegral $ LBS.length c
 statNode (NDirectory _) = dirStat
 statNode (NSymlink t) = linkStat t
 
-narGetFileStat :: RuntimeState -> FilePath -> IO (Either Errno FileStat)
-narGetFileStat _ "/" = do
-    return $ Right $ dirStat
-narGetFileStat state x = do
-  let (storepath:pathparts) = splitPath x
-  hnd1 <- getNarHandle state storepath
-  case hnd1 of
-    Just (NARFile root) -> do
-      case traverseNodes root pathparts of
-        Just n -> return $ Right $ statNode n
-        Nothing -> return $ Left $ eNOENT
-    Nothing -> return $ Left eNOENT
+-- possibly rename
+findNode :: RuntimeState -> String -> IO (Maybe NARNode)
+findNode state p = go $ splitPath p
+  where
+    go (sp:pp) = (>>= (`traverseNodes` pp) . _root) <$> getNarHandle state sp
+    go _       = return Nothing
 
-narReadSymbolicLink :: RuntimeState -> FilePath -> IO (Either Errno FilePath)
-narReadSymbolicLink state x = do
-  let (storepath:pathparts) = splitPath x
-  hnd1 <- getNarHandle state storepath
-  case hnd1 of
-    Just (NARFile root) -> do
-      case traverseNodes root pathparts of
-        Just (NSymlink t) -> return $ Right $ LBSC.unpack t
-        Nothing -> return $ Left eNOENT
-    Nothing -> return $ Left eNOENT
+narGetFileStat :: RuntimeState -> FilePath -> IO (Either Errno FileStat)
+narGetFileStat _     "/" = return $ Right dirStat
+narGetFileStat state x   = maybe (Left eNOENT) (Right . statNode)
+                           <$> findNode state x
+
+narReadSymlink :: RuntimeState -> FilePath -> IO (Either Errno FilePath)
+narReadSymlink state x = do m <- findNode state x
+                            return $ case m
+                                     of Just (NSymlink t) -> Right $ LBSC.unpack t
+                                        Just _            -> Left eFAULT
+                                        Nothing           -> Left eNOENT
 
 narOpen :: RuntimeState -> FilePath -> OpenMode -> OpenFileFlags -> IO (Either Errno HT)
-narOpen state path _ _ = do
-  let (storepath:pathparts) = splitPath path
-  putStrLn $ "fopen " <> show storepath <> show pathparts
-  hnd1 <- getNarHandle state storepath
-  case hnd1 of
-    Just (NARFile root) -> do
-      case traverseNodes root pathparts of
-        Just n -> return $ Right $ HT n
-        Nothing -> return $ Left eNOENT
-    Nothing -> return $ Left eNOENT
+narOpen state p _ _ = maybe (Left eNOENT) (Right . HT) <$> findNode state p
 
 narRead :: RuntimeState -> FilePath -> HT -> ByteCount -> FileOffset -> IO (Either Errno BS.ByteString)
 narRead _ path hnd byteCount offset = do
@@ -437,42 +386,28 @@ narRead _ path hnd byteCount offset = do
     substr offset2 size input = LBSC.take size (LBSC.drop offset2 input)
 
 getNarHandle :: RuntimeState -> String -> IO (Maybe NARFile)
-getNarHandle state storepath = go
+getNarHandle state p = takeMVar (_narCache state)
+                       >>= \c -> decide (Map.lookup p c) c
   where
-    go = do
-      cache <- takeMVar (_NarCache state)
-      --putStrLn "dumping cache"
-      --print cache
-      let result = Map.lookup storepath cache
-      decide result cache
-    file1 = _DataDir state <> "/" <> (head $ splitPath storepath) <> ".nar"
-    unsafeNewHandle :: FilePath -> IO NARFile
-    unsafeNewHandle file2 = newDecodeNARFile $ trace ("opening file " <> file2) file2
-    newHandle :: FilePath -> IO (Maybe NARFile)
-    newHandle file = catch
-      (do
-        hnd <- unsafeNewHandle file
-        return $ Just hnd)
-      (\x -> do
-        putStrLn $ "caught:" <> show (x :: IOException)
-        return Nothing
-      )
-    decide :: Maybe NARFile -> Map.HashMap String NARFile -> IO (Maybe NARFile)
+    file1 = _dataDir state <> "/" <> head (splitPath p) <> ".nar"
+    newHandle file = catch (Just <$> newDecodeNARFile file) handleError
+    handleError :: IOException -> IO (Maybe a)
+    handleError e = putStrLn ("caught:" <> show e) >> return Nothing
+    decide :: Maybe NARFile -> Map String NARFile -> IO (Maybe NARFile)
     decide res cache = case res of
-      (Just f) -> do
-        putMVar (_NarCache state) cache
-        return $ Just f
-      (Nothing) -> do
-        new_entry <- newHandle file1
-        case new_entry of
-          Just e -> do
-            let new_cache = Map.insert storepath e cache
-            putMVar (_NarCache state) new_cache
-            return new_entry
-          Nothing -> do
-            putStrLn "open fail"
-            putMVar (_NarCache state) cache
-            return Nothing
+      Just f  -> putMVar (_narCache state) cache >> return (Just f)
+      Nothing -> do newEntry <- newHandle file1
+                    case newEntry
+                      of Just e -> do
+                           putMVar (_narCache state) $ Map.insert p e cache
+                           return newEntry
+                         Nothing -> do
+                           putStrLn "open fail"
+                           putMVar (_narCache state) cache
+                           return Nothing
+
+dotDirs :: [(FilePath, FileStat)]
+dotDirs = [(".", dirStat), ("..", dirStat)]
 
 narOpenDirectory :: RuntimeState -> FilePath -> IO Errno
 --narOpenDirectory state "/" = return eOK
@@ -480,26 +415,20 @@ narOpenDirectory _ _ = return eOK -- TODO, check if dir is a directory
 
 narReadDirectory :: RuntimeState -> FilePath -> IO (Either Errno [(FilePath, FileStat)])
 narReadDirectory state "/" = do
-  listing <- getDirectoryContents $ _DataDir state
-  return $ Right $ [(".",    dirStat),
-                    ("..",   dirStat)] <> makeListing listing
+  listing <- getDirectoryContents $ _dataDir state
+  return $ Right $ dotDirs <> makeListing listing
   where
-    makeListing listing = map (\nar -> (nar, dirStat)) $ getNARFiles listing -- FIXME, return the right stat
-narReadDirectory state dir = do
-  let (storepath:pathparts) = splitPath dir
+    makeListing listing = map (\nar -> (nar, dirStat)) $ getNARFiles listing
+    -- FIXME, return the right stat
+narReadDirectory state (splitPath -> storepath:pathparts) = do
   hnd1 <- getNarHandle state storepath
-  --putStrLn $ "readdir " <> show pathparts
-  case hnd1 of
-    Just (NARFile root) -> do
-      let
-        cwd = traverseNodes root pathparts
-      case cwd of
-        Just dir -> return $ Right $ [(".",    dirStat),("..",   dirStat)] <> addStats dir
-        Nothing -> return $ Left $ eNOENT
-    Nothing -> return $ Left eNOENT
+  return $ case hnd1 >>= (`traverseNodes` pathparts) . _root
+           of Just dir -> Right $ dotDirs <> addStats dir
+              _        -> Left eNOENT
   where
     mapFn1 :: Name -> NARNode -> (String, FileStat)
-    mapFn1 key value = (LBSC.unpack key, statNode value)
+    mapFn1 = curry (LBSC.unpack *** statNode)
 
     addStats :: NARNode -> [(String, FileStat)]
     addStats (NDirectory e) = toList $ Map.mapWithKey mapFn1 e
+narReadDirectory state _ = error "FIXME"
